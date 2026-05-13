@@ -1,12 +1,29 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
+import { simplifyText } from "./services/api.js";
+import {
+  buildSimplifyInputFromDocument,
+  getDocumentApiBaseUrl,
+  predictDocumentTypeFromFile,
+  resizeImageBeforeUpload,
+  type DocumentPredictionResult,
+} from "./services/documentPredict";
 
 function App() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
-  const [documentResult, setDocumentResult] = useState<any>(null);
+  const [documentResult, setDocumentResult] =
+    useState<DocumentPredictionResult | null>(null);
   const [imageDescriptionResult, setImageDescriptionResult] = useState<any>(null);
+
+  const [readingText, setReadingText] = useState("");
+  const [cardIdForSimplify, setCardIdForSimplify] = useState("");
+  const [simplifiedText, setSimplifiedText] = useState("");
+  const [simplifySource, setSimplifySource] = useState("");
+  const [pipelineStep, setPipelineStep] = useState<
+    null | "identifying" | "simplifying"
+  >(null);
 
   const [documentLoading, setDocumentLoading] = useState(false);
   const [descriptionLoading, setDescriptionLoading] = useState(false);
@@ -18,11 +35,8 @@ function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  const DOCUMENT_API_URL =
-    "http://172.27.206.233:8000/document/predict-document-type";
-
-  const IMAGE_DESCRIPTION_API_URL =
-    "http://172.27.206.233:8000/image/describe-image";
+  const apiBase = getDocumentApiBaseUrl();
+  const IMAGE_DESCRIPTION_API_URL = `${apiBase.replace(/\/$/, "")}/image/describe-image`;
 
   useEffect(() => {
     if (!cameraActive) return;
@@ -71,76 +85,6 @@ function App() {
     };
   }, [cameraActive]);
 
-  const resizeImageBeforeUpload = (file: File): Promise<File> => {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      const reader = new FileReader();
-
-      reader.onload = (event) => {
-        img.src = event.target?.result as string;
-      };
-
-      img.onload = () => {
-        const maxSize = 900;
-
-        let width = img.width;
-        let height = img.height;
-
-        if (width > height) {
-          if (width > maxSize) {
-            height = Math.round((height * maxSize) / width);
-            width = maxSize;
-          }
-        } else {
-          if (height > maxSize) {
-            width = Math.round((width * maxSize) / height);
-            height = maxSize;
-          }
-        }
-
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-
-        const ctx = canvas.getContext("2d");
-
-        if (!ctx) {
-          reject(new Error("Could not resize image"));
-          return;
-        }
-
-        ctx.drawImage(img, 0, 0, width, height);
-
-        canvas.toBlob(
-          (blob) => {
-            if (!blob) {
-              reject(new Error("Could not create resized image"));
-              return;
-            }
-
-            const resizedFile = new File([blob], "resized_document.jpg", {
-              type: "image/jpeg",
-            });
-
-            resolve(resizedFile);
-          },
-          "image/jpeg",
-          0.85
-        );
-      };
-
-      img.onerror = () => {
-        reject(new Error("Could not load image"));
-      };
-
-      reader.onerror = () => {
-        reject(new Error("Could not read image file"));
-      };
-
-      reader.readAsDataURL(file);
-    });
-  };
-
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
 
@@ -152,6 +96,9 @@ function App() {
     setPreviewUrl(URL.createObjectURL(file));
     setDocumentResult(null);
     setImageDescriptionResult(null);
+    setSimplifiedText("");
+    setSimplifySource("");
+    setPipelineStep(null);
   };
 
   const startCamera = () => {
@@ -159,6 +106,9 @@ function App() {
     setSelectedFile(null);
     setDocumentResult(null);
     setImageDescriptionResult(null);
+    setSimplifiedText("");
+    setSimplifySource("");
+    setPipelineStep(null);
     setCameraError(null);
     setCameraReady(false);
     setCameraActive(true);
@@ -217,6 +167,9 @@ function App() {
         setPreviewUrl(dataUrl);
         setDocumentResult(null);
         setImageDescriptionResult(null);
+        setSimplifiedText("");
+        setSimplifySource("");
+        setPipelineStep(null);
 
         stopCamera();
       })
@@ -236,27 +189,51 @@ function App() {
     setDocumentResult(null);
 
     try {
-      const resizedFile = await resizeImageBeforeUpload(selectedFile);
-
-      const formData = new FormData();
-      formData.append("file", resizedFile);
-
-      const response = await fetch(DOCUMENT_API_URL, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error("Backend returned an error.");
-      }
-
-      const data = await response.json();
+      const data = await predictDocumentTypeFromFile(selectedFile);
       setDocumentResult(data);
     } catch (error) {
       console.error(error);
       alert("Document prediction failed. Please check backend is running.");
     } finally {
       setDocumentLoading(false);
+    }
+  };
+
+  const identifyDocumentThenSimplify = async () => {
+    if (!selectedFile) {
+      alert("Please select or capture a document image first.");
+      return;
+    }
+    if (!readingText.trim()) {
+      alert("Please enter the reading text to simplify.");
+      return;
+    }
+    const card = cardIdForSimplify.trim().toUpperCase();
+    if (!card) {
+      alert("Please enter a card ID (RFID) so text can be simplified for that user profile.");
+      return;
+    }
+
+    setDocumentResult(null);
+    setSimplifiedText("");
+    setSimplifySource("");
+    setPipelineStep("identifying");
+
+    try {
+      const doc = await predictDocumentTypeFromFile(selectedFile);
+      setDocumentResult(doc);
+      setPipelineStep("simplifying");
+      const textForSimplifier = buildSimplifyInputFromDocument(doc, readingText);
+      const result = await simplifyText(card, textForSimplifier);
+      setSimplifiedText(result.simplified_text);
+      setSimplifySource(result.source ?? "");
+    } catch (error) {
+      console.error(error);
+      alert(
+        "Pipeline failed. Ensure the document backend and reading API (VITE_API_BASE_URL) are running, and the card ID is registered."
+      );
+    } finally {
+      setPipelineStep(null);
     }
   };
 
@@ -299,7 +276,10 @@ function App() {
       <div className="container">
         <header className="header">
           <h1>Smart Wearable Reading Assistant</h1>
-          <p>Document Identification + Inside Page Image Description Demo</p>
+          <p>
+            Document identification, reading text simplification (sequential pipeline), and
+            inside-page image description.
+          </p>
         </header>
 
         <div className="grid">
@@ -365,9 +345,68 @@ function App() {
               </div>
             )}
 
+            <h3 className="section-title" style={{ marginTop: "1.25rem" }}>
+              Reading text &amp; pipeline
+            </h3>
+            <p className="small-text">
+              Enter the passage to simplify. The system first classifies the uploaded page image,
+              then sends the identification summary together with your text to the simplification
+              API (registered card ID required).
+            </p>
+            <label className="small-text" style={{ display: "block", marginTop: "0.5rem" }}>
+              Card ID (user profile for /simplify)
+            </label>
+            <input
+              type="text"
+              value={cardIdForSimplify}
+              onChange={(e) => setCardIdForSimplify(e.target.value)}
+              placeholder="e.g. T001"
+              style={{ width: "100%", marginBottom: "0.5rem", padding: "0.5rem" }}
+            />
+            <label className="small-text" style={{ display: "block" }}>
+              Reading text
+            </label>
+            <textarea
+              value={readingText}
+              onChange={(e) => setReadingText(e.target.value)}
+              placeholder="Paste the text to simplify after document identification…"
+              rows={5}
+              style={{ width: "100%", marginBottom: "0.75rem", padding: "0.5rem" }}
+            />
+
+            {pipelineStep === "identifying" && (
+              <p className="small-text" aria-live="polite">
+                Identifying document…
+              </p>
+            )}
+            {pipelineStep === "simplifying" && (
+              <p className="small-text" aria-live="polite">
+                Simplifying text…
+              </p>
+            )}
+
+            <button
+              type="button"
+              onClick={() => void identifyDocumentThenSimplify()}
+              disabled={
+                documentLoading ||
+                descriptionLoading ||
+                pipelineStep !== null
+              }
+              className="predict-btn"
+            >
+              {pipelineStep === "identifying"
+                ? "Identifying…"
+                : pipelineStep === "simplifying"
+                  ? "Simplifying…"
+                  : "Identify document & simplify text"}
+            </button>
+
             <button
               onClick={predictDocument}
-              disabled={documentLoading || descriptionLoading}
+              disabled={
+                documentLoading || descriptionLoading || pipelineStep !== null
+              }
               className="predict-btn"
             >
               {documentLoading ? "Predicting..." : "Predict Document"}
@@ -375,7 +414,9 @@ function App() {
 
             <button
               onClick={describeImage}
-              disabled={documentLoading || descriptionLoading}
+              disabled={
+                documentLoading || descriptionLoading || pipelineStep !== null
+              }
               className="describe-btn"
             >
               {descriptionLoading ? "Describing..." : "Describe Image"}
@@ -385,9 +426,10 @@ function App() {
           <section className="card result-card">
             <h2>Model Output</h2>
 
-            {!documentResult && !imageDescriptionResult && (
+            {!documentResult && !imageDescriptionResult && !simplifiedText && (
               <p className="empty-text">
-                Results will appear here after prediction or image description.
+                Results will appear here after prediction, the identify→simplify pipeline, or
+                image description.
               </p>
             )}
 
@@ -447,6 +489,20 @@ function App() {
                 </div>
               </div>
             )}
+
+            {simplifiedText ? (
+              <div className="result-content">
+                <h3 className="section-title">Simplified reading output</h3>
+                <div className="message-box">
+                  <p style={{ whiteSpace: "pre-wrap" }}>{simplifiedText}</p>
+                </div>
+                {simplifySource ? (
+                  <p className="small-text">
+                    <strong>Source:</strong> {simplifySource}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
           </section>
         </div>
       </div>
